@@ -26,7 +26,7 @@ android {
 }
 
 dependencies {
-    implementation("com.facebook.react:react-android:0.75.3")
+    implementation("com.facebook.react:react-android:0.81.5")
 
     implementation "org.jetbrains.kotlin:kotlin-stdlib"
 

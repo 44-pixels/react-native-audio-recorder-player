@@ -1,0 +1,12 @@
+plugins {
+    id 'com.android.library' version '8.3.2' apply false
+    id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+}
+
+ext {
+    compileSdkVersion = 34
+    minSdkVersion = 24
+    targetSdkVersion = 34
+    reactNativeVersion = "0.75.+" // or your exact RN version
+    androidXVersion = '1.6.0'
+}

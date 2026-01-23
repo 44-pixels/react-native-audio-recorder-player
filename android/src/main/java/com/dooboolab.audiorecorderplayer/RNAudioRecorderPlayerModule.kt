@@ -1,7 +1,9 @@
 package com.dooboolab.audiorecorderplayer
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.net.Uri
@@ -49,6 +51,12 @@ class RNAudioRecorderPlayerModule(private val reactContext: ReactApplicationCont
     private var pausedRecordTime = 0L
     private var totalPausedRecordTime = 0L
     var recordHandler: Handler? = Handler(Looper.getMainLooper())
+    
+    // Audio focus management for handling call interruptions
+    private var audioManager: AudioManager? = null
+    private var audioFocusChangeListener: AudioManager.OnAudioFocusChangeListener? = null
+    private var wasRecordingBeforeInterruption = false
+    
     override fun getName(): String {
         return tag
     }
@@ -63,6 +71,90 @@ class RNAudioRecorderPlayerModule(private val reactContext: ReactApplicationCont
         val obj = Arguments.createMap()
         obj.putString("state", newState.mapToReactState())
         sendEvent(reactContext, "rn-recording-state", obj)
+    }
+    
+    /**
+     * Set up audio focus to handle interruptions like incoming calls.
+     * When audio focus is lost (e.g., phone call), recording will be paused.
+     */
+    private fun setupAudioFocus() {
+        audioManager = reactContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        
+        audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+            when (focusChange) {
+                AudioManager.AUDIOFOCUS_LOSS,
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                    // Another app took audio focus - pause recording
+                    if (mediaRecorder != null && recordingState == RecordingState.RECORDING) {
+                        Log.d(tag, "Audio focus lost, pausing recording")
+                        wasRecordingBeforeInterruption = true
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                                mediaRecorder?.pause()
+                                pausedRecordTime = SystemClock.elapsedRealtime()
+                                recorderRunnable?.let { recordHandler?.removeCallbacks(it) }
+                                updateRecordingState(RecordingState.INTERRUPTED)
+                            }
+                        } catch (e: Exception) {
+                            Log.e(tag, "Error pausing recorder on focus loss: ${e.message}")
+                        }
+                    }
+                }
+                AudioManager.AUDIOFOCUS_GAIN -> {
+                    // Audio focus regained - auto-resume if we were recording before interruption
+                    // This matches iOS behavior which also auto-resumes after interruption
+                    Log.d(tag, "Audio focus regained")
+                    if (wasRecordingBeforeInterruption && mediaRecorder != null && 
+                        recordingState == RecordingState.INTERRUPTED) {
+                        // Delay before resuming to match iOS behavior (0.5 seconds)
+                        // This avoids conflicts with other apps that may still be releasing resources
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            try {
+                                // Verify foreground service is still running and recorder is valid
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && 
+                                    mediaRecorder != null &&
+                                    RecordingForegroundService.isServiceRunning()) {
+                                    mediaRecorder?.resume()
+                                    totalPausedRecordTime += SystemClock.elapsedRealtime() - pausedRecordTime
+                                    recorderRunnable?.let { recordHandler?.postDelayed(it, subsDurationMillis.toLong()) }
+                                    updateRecordingState(RecordingState.RECORDING)
+                                    Log.d(tag, "Recording resumed after interruption")
+                                } else {
+                                    Log.w(tag, "Cannot resume: service not running or recorder null")
+                                    updateRecordingState(RecordingState.PAUSED)
+                                }
+                            } catch (e: Exception) {
+                                Log.e(tag, "Error resuming recorder after interruption: ${e.message}")
+                                // If resume fails, update state to paused so app knows
+                                updateRecordingState(RecordingState.PAUSED)
+                            }
+                            wasRecordingBeforeInterruption = false
+                        }, 500) // 500ms delay to match iOS interruptionRecoveryDelay
+                    }
+                }
+            }
+        }
+        
+        // Request audio focus
+        @Suppress("DEPRECATION")
+        audioManager?.requestAudioFocus(
+            audioFocusChangeListener,
+            AudioManager.STREAM_MUSIC,
+            AudioManager.AUDIOFOCUS_GAIN
+        )
+    }
+    
+    /**
+     * Release audio focus when recording stops.
+     */
+    private fun releaseAudioFocus() {
+        audioFocusChangeListener?.let { listener ->
+            @Suppress("DEPRECATION")
+            audioManager?.abandonAudioFocus(listener)
+        }
+        audioFocusChangeListener = null
+        audioManager = null
+        wasRecordingBeforeInterruption = false
     }
 
     @ReactMethod
@@ -104,6 +196,18 @@ class RNAudioRecorderPlayerModule(private val reactContext: ReactApplicationCont
             promise.reject("InvalidState", "startRecorder has already been called.")
             return
         }
+
+        // Start foreground service BEFORE starting the MediaRecorder
+        // This ensures we have permission to use the microphone in background
+        try {
+            RecordingForegroundService.start(reactContext)
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to start foreground service, recording may not work in background: ${e.message}")
+            // Continue anyway - recording will still work in foreground
+        }
+        
+        // Set up audio focus to handle interruptions (e.g., incoming calls)
+        setupAudioFocus()
 
         var newMediaRecorder: MediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             MediaRecorder(reactContext)
@@ -188,6 +292,16 @@ class RNAudioRecorderPlayerModule(private val reactContext: ReactApplicationCont
         } catch (e: Exception) {
             newMediaRecorder.release()
             mediaRecorder = null
+            
+            // Release audio focus
+            releaseAudioFocus()
+            
+            // Stop foreground service if recording failed to start
+            try {
+                RecordingForegroundService.stop(reactContext)
+            } catch (serviceError: Exception) {
+                Log.w(tag, "Failed to stop foreground service: ${serviceError.message}")
+            }
 
             Log.e(tag, "Exception: ", e)
             promise.reject("startRecord", e.message)
@@ -254,10 +368,32 @@ class RNAudioRecorderPlayerModule(private val reactContext: ReactApplicationCont
             mediaRecorder!!.release()
             mediaRecorder = null
             updateRecordingState(RecordingState.STOPPED)
+            
+            // Release audio focus
+            releaseAudioFocus()
+            
+            // Stop the foreground service now that recording is complete
+            try {
+                RecordingForegroundService.stop(reactContext)
+            } catch (e: Exception) {
+                Log.w(tag, "Failed to stop foreground service: ${e.message}")
+            }
+            
             return audioFileURL // return the path (no scheme prefix)
         } catch (e: RuntimeException) {
             mediaRecorder = null
             updateRecordingState(RecordingState.ERROR)
+            
+            // Release audio focus
+            releaseAudioFocus()
+            
+            // Stop the foreground service even on error
+            try {
+                RecordingForegroundService.stop(reactContext)
+            } catch (serviceError: Exception) {
+                Log.w(tag, "Failed to stop foreground service: ${serviceError.message}")
+            }
+            
             throw e
         }
     }

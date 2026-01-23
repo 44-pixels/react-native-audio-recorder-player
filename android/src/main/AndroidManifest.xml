@@ -1,7 +1,16 @@
-
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
           package="com.dooboolab.audiorecorderplayer">
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <!-- Required for background audio recording on Android 14+ (SDK 34+) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <application>
+        <!-- Foreground service for background audio recording -->
+        <service
+            android:name=".RecordingForegroundService"
+            android:foregroundServiceType="microphone"
+            android:exported="false" />
+    </application>
 </manifest>
-  

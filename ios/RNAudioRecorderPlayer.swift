@@ -369,11 +369,20 @@ class RNAudioRecorderPlayer: RCTEventEmitter, AVAudioRecorderDelegate {
 
     func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
         if !flag {
-            print("Failed to stop recorder")
-            // Clean up state
+            print("[RNAudioRecorderPlayer] Recording finished unsuccessfully")
             self.currentAudioRecorder = nil
             self.recordTimer = nil
+            self.recordingDidFinish()
+            self.sendEvent(withName: "rn-recording-state", body: ["state": "error"])
         }
+    }
+
+    func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
+        print("[RNAudioRecorderPlayer] Encode error: \(error?.localizedDescription ?? "unknown")")
+        self.currentAudioRecorder = nil
+        self.recordTimer = nil
+        self.recordingDidFinish()
+        self.sendEvent(withName: "rn-recording-state", body: ["state": "error"])
     }
 
     /**********               Player               **********/

@@ -39,7 +39,11 @@ enum RecorderError: LocalizedError {
         case .recordingPermissionNotGranted:
             return "Recording permission not granted"
         case .audioSessionError(let error):
-            return error.localizedDescription
+            // Surface domain + code so JS-side Crashlytics buckets distinguish e.g.
+            // AVAudioSessionErrorCodeIsBusy (other audio in progress, e.g. phone call)
+            // from AVAudioSessionErrorCodeCannotInterruptOthers, etc.
+            let nsError = error as NSError
+            return "\(nsError.localizedDescription) [\(nsError.domain) #\(nsError.code)]"
         }
     }
 }
@@ -83,6 +87,13 @@ class RNAudioRecorderPlayer: RCTEventEmitter, AVAudioRecorderDelegate {
     override init() {
         super.init()
         NotificationCenter.default.addObserver(self, selector: #selector(handleAudioSessionInterruption(_:)), name: AVAudioSession.interruptionNotification, object: AVAudioSession.sharedInstance())
+        // Route changes (headphones removed, AirPods disconnected, mic switched, etc.)
+        // are a common reason recordings silently fail to resume after pause/interrupt.
+        NotificationCenter.default.addObserver(self, selector: #selector(handleAudioSessionRouteChange(_:)), name: AVAudioSession.routeChangeNotification, object: AVAudioSession.sharedInstance())
+        // Media services reset means the audio server died: every session/recorder is
+        // invalidated and we must teardown + recreate. Surface it so JS analytics can
+        // explain otherwise-mysterious "Cannot start recording" failures.
+        NotificationCenter.default.addObserver(self, selector: #selector(handleMediaServicesReset(_:)), name: AVAudioSession.mediaServicesWereResetNotification, object: AVAudioSession.sharedInstance())
     }
 
     deinit {
@@ -94,7 +105,7 @@ class RNAudioRecorderPlayer: RCTEventEmitter, AVAudioRecorderDelegate {
     }
 
     override func supportedEvents() -> [String]! {
-        return ["rn-playback", "rn-recordback", "rn-recording-state"]
+        return ["rn-playback", "rn-recordback", "rn-recording-state", "rn-audio-session-event"]
     }
 
     func updateAudioFileURL(path: String, format: AudioFormatID = kAudioFormatMPEG4AAC) {
@@ -120,7 +131,7 @@ class RNAudioRecorderPlayer: RCTEventEmitter, AVAudioRecorderDelegate {
                 self.sendEvent(withName: "rn-recording-state", body: ["state": "recording"])
                 resolve(url.absoluteString)
             case .failure(let error):
-                reject("RNAudioPlayerRecorder", error.localizedDescription, error)
+                reject("RNAudioPlayerRecorder", self.recorderErrorMessage(error), error)
             }
         }
     }
@@ -131,6 +142,8 @@ class RNAudioRecorderPlayer: RCTEventEmitter, AVAudioRecorderDelegate {
             try pauseCurrentRecording()
             sendEvent(withName: "rn-recording-state", body: ["state": "paused"])
             resolve("Recorder paused!")
+        } catch let error as RecorderError {
+            reject("RNAudioPlayerRecorder", recorderErrorMessage(error), error)
         } catch {
             reject("RNAudioPlayerRecorder", error.localizedDescription, error)
         }
@@ -142,6 +155,8 @@ class RNAudioRecorderPlayer: RCTEventEmitter, AVAudioRecorderDelegate {
             try resumeCurrentRecording()
             sendEvent(withName: "rn-recording-state", body: ["state": "recording"])
             resolve("Recorder resumed!")
+        } catch let error as RecorderError {
+            reject("RNAudioPlayerRecorder", recorderErrorMessage(error), error)
         } catch {
             reject("RNAudioPlayerRecorder", error.localizedDescription, error)
         }
@@ -155,9 +170,18 @@ class RNAudioRecorderPlayer: RCTEventEmitter, AVAudioRecorderDelegate {
                 self.sendEvent(withName: "rn-recording-state", body: ["state": "stopped"])
                 resolve(url.absoluteString)
             case .failure(let error):
-                reject("RNAudioPlayerRecorder", error.localizedDescription, error)
+                reject("RNAudioPlayerRecorder", self.recorderErrorMessage(error), error)
             }
         }
+    }
+
+    /// Bypasses Swift's `LocalizedError` -> NSError bridging, which sometimes fails to
+    /// surface our custom `errorDescription` (especially for the `.audioSessionError`
+    /// case that wraps an underlying NSError) and instead leaks just the inner error's
+    /// `localizedDescription` to JS. Calling `errorDescription` directly guarantees
+    /// JS-side analytics receive the formatted "<description> [<domain> #<code>]" string.
+    private func recorderErrorMessage(_ error: RecorderError) -> String {
+        return error.errorDescription ?? error.localizedDescription
     }
 
     @objc(updateRecorderProgress:)
@@ -226,9 +250,19 @@ class RNAudioRecorderPlayer: RCTEventEmitter, AVAudioRecorderDelegate {
             wasRecordingBeforeInterruption = currentAudioRecorder?.isRecording ?? false
             guard wasRecordingBeforeInterruption else { break }
 
+            // Capture the system-provided interruption reason so JS-side analytics can
+            // distinguish phone-call interruptions from app-suspended / mic-muted /
+            // route-disconnected, which all surface here but have different mitigations.
+            let reasonName = audioSessionInterruptionReasonName(from: userInfo)
+            let secondaryAudioActive = audioSession.secondaryAudioShouldBeSilencedHint
+
             do {
                 try pauseCurrentRecording()
-                sendEvent(withName: "rn-recording-state", body: ["state": "interrupted"])
+                sendEvent(withName: "rn-recording-state", body: [
+                    "state": "interrupted",
+                    "reason": reasonName,
+                    "secondaryAudioActive": secondaryAudioActive,
+                ])
             } catch {
                 // We don't expect it to fail to pause the recording
             }
@@ -239,25 +273,122 @@ class RNAudioRecorderPlayer: RCTEventEmitter, AVAudioRecorderDelegate {
 
             // Only attempt to resume if the system indicates it is allowed
             let options = AVAudioSession.InterruptionOptions(rawValue: userInfo[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
-            if options.contains(.shouldResume) {
+            let shouldResume = options.contains(.shouldResume)
+            if shouldResume {
                 // Delay before resuming to avoid conflicts with third-party SDKs that may
                 // deactivate the audio session shortly after the interruption ends (looking at you, Twilio)
                 DispatchQueue.main.asyncAfter(deadline: .now() + interruptionRecoveryDelay) {
                     do {
                         try self.resumeCurrentRecording()
-                        self.sendEvent(withName: "rn-recording-state", body: ["state": "recording"])
+                        self.sendEvent(withName: "rn-recording-state", body: [
+                            "state": "recording",
+                            "trigger": "auto_resume",
+                            "shouldResume": true,
+                        ])
                     } catch {
-                        self.sendEvent(withName: "rn-recording-state", body: ["state": "paused"])
+                        // Surface the underlying NSError so JS analytics can tell apart
+                        // "still in a call" failures from generic activation errors.
+                        let nsError = error as NSError
+                        self.sendEvent(withName: "rn-recording-state", body: [
+                            "state": "paused",
+                            "trigger": "auto_resume_failed",
+                            "shouldResume": true,
+                            "errorMessage": nsError.localizedDescription,
+                            "errorDomain": nsError.domain,
+                            "errorCode": nsError.code,
+                        ])
                     }
                 }
             } else {
-                sendEvent(withName: "rn-recording-state", body: ["state": "paused"])
+                sendEvent(withName: "rn-recording-state", body: [
+                    "state": "paused",
+                    "trigger": "interruption_ended",
+                    "shouldResume": false,
+                ])
             }
             wasRecordingBeforeInterruption = false
             break
         default:
             break
         }
+    }
+
+    /// Emits route change events (headset plugged/unplugged, AirPods disconnect,
+    /// category change, etc.) while a recording is active. We skip when not recording
+    /// to keep the noise floor low — these notifications fire constantly during
+    /// playback or background app activity.
+    @objc
+    func handleAudioSessionRouteChange(_ notification: Notification) {
+        guard
+            currentAudioRecorder != nil,
+            let userInfo = notification.userInfo,
+            let rawReason = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+            let reason = AVAudioSession.RouteChangeReason(rawValue: rawReason)
+        else { return }
+
+        let previousRoute = userInfo[AVAudioSessionRouteChangePreviousRouteKey] as? AVAudioSessionRouteDescription
+        let currentRoute = audioSession.currentRoute
+
+        sendEvent(withName: "rn-audio-session-event", body: [
+            "type": "route_change",
+            "reason": routeChangeReasonName(reason),
+            "previousInputs": previousRoute?.inputs.map { $0.portType.rawValue } ?? [],
+            "currentInputs": currentRoute.inputs.map { $0.portType.rawValue },
+            "previousOutputs": previousRoute?.outputs.map { $0.portType.rawValue } ?? [],
+            "currentOutputs": currentRoute.outputs.map { $0.portType.rawValue },
+        ])
+    }
+
+    /// Audio server crashed — every session/recorder is invalidated. We forward this
+    /// as a critical signal to JS analytics so we can correlate it with downstream
+    /// "Cannot start recording" / "Recorder is not recording" errors.
+    @objc
+    func handleMediaServicesReset(_ notification: Notification) {
+        sendEvent(withName: "rn-audio-session-event", body: [
+            "type": "media_services_reset",
+            "wasRecording": currentAudioRecorder != nil,
+        ])
+    }
+
+    private func routeChangeReasonName(_ reason: AVAudioSession.RouteChangeReason) -> String {
+        switch reason {
+        case .unknown: return "unknown"
+        case .newDeviceAvailable: return "new_device_available"
+        case .oldDeviceUnavailable: return "old_device_unavailable"
+        case .categoryChange: return "category_change"
+        case .override: return "override"
+        case .wakeFromSleep: return "wake_from_sleep"
+        case .noSuitableRouteForCategory: return "no_suitable_route_for_category"
+        case .routeConfigurationChange: return "route_configuration_change"
+        @unknown default: return "unknown"
+        }
+    }
+
+    /// Maps the iOS-provided interruption reason to a stable string the JS layer can
+    /// forward to analytics. Falls back to "default" for builds older than iOS 14.5
+    /// (where the reason key isn't populated) and for unknown future reasons.
+    private func audioSessionInterruptionReasonName(from userInfo: [AnyHashable: Any]) -> String {
+        if #available(iOS 14.5, *) {
+            guard
+                let rawReason = userInfo[AVAudioSessionInterruptionReasonKey] as? UInt,
+                let reason = AVAudioSession.InterruptionReason(rawValue: rawReason)
+            else { return "default" }
+
+            // .routeDisconnected (iOS 17+) is matched via raw value to keep the source
+            // compiling against iOS 16 SDKs without requiring an availability guard.
+            switch reason {
+            case .default:
+                return "default"
+            case .appWasSuspended:
+                return "app_was_suspended"
+            case .builtInMicMuted:
+                return "built_in_mic_muted"
+            @unknown default:
+                if reason.rawValue == 3 { return "route_disconnected" }
+                return "unknown"
+            }
+        }
+        return "default"
     }
 
     private func startNewRecording(path: String, audioSets: [String: Any], meteringEnabled: Bool, completion: @escaping (Result<URL, RecorderError>) -> Void) {

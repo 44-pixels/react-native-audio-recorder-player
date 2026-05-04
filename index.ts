@@ -150,9 +150,66 @@ export type RecordBackType = {
   currentMetering?: number;
 };
 
+export type RecordingInterruptionReason =
+  | 'default'
+  | 'app_was_suspended'
+  | 'built_in_mic_muted'
+  | 'route_disconnected'
+  | 'unknown';
+
+export type RecordingStateTrigger =
+  | 'auto_resume'
+  | 'auto_resume_failed'
+  | 'interruption_ended';
+
 export type RecordingStateType = {
   state: 'recording' | 'paused' | 'interrupted' | 'stopped';
+  // Populated only on iOS for state changes triggered by AVAudioSession
+  // interruptions (phone calls, alarms, mic mute, route changes, etc.).
+  reason?: RecordingInterruptionReason;
+  // True if another app's audio is active when the interruption began (iOS hint).
+  secondaryAudioActive?: boolean;
+  // Distinguishes user-initiated state transitions from native-driven ones
+  // (auto-resume after interruption end, etc.). Only set on iOS.
+  trigger?: RecordingStateTrigger;
+  // System hint that auto-resume should be attempted at interruption end.
+  shouldResume?: boolean;
+  // For trigger === 'auto_resume_failed': the underlying NSError from
+  // AVAudioSession.setActive(true), surfaced verbatim for diagnostics.
+  errorMessage?: string;
+  errorDomain?: string;
+  errorCode?: number;
 };
+
+export type AudioSessionRouteChangeReason =
+  | 'unknown'
+  | 'new_device_available'
+  | 'old_device_unavailable'
+  | 'category_change'
+  | 'override'
+  | 'wake_from_sleep'
+  | 'no_suitable_route_for_category'
+  | 'route_configuration_change';
+
+// Discriminated union of session-level events emitted from native (iOS only).
+// Distinct from RecordingStateType because these don't change the recording's
+// JS-visible state — they just carry diagnostic context for analytics.
+export type AudioSessionEventType =
+  | {
+      type: 'route_change';
+      reason: AudioSessionRouteChangeReason;
+      // AVAudioSessionPort raw values (e.g. "MicrophoneBuiltIn", "BluetoothA2DPInput").
+      previousInputs: string[];
+      currentInputs: string[];
+      previousOutputs: string[];
+      currentOutputs: string[];
+    }
+  | {
+      type: 'media_services_reset';
+      // Whether a recording was active when the audio server crashed; informs
+      // whether downstream cleanup needs to recreate the recorder.
+      wasRecording: boolean;
+    };
 
 export type PlayBackType = {
   isMuted?: boolean;
@@ -168,6 +225,7 @@ class AudioRecorderPlayer {
   private _hasPausedRecord: boolean;
   private _recorderSubscription: EmitterSubscription | null;
   private _recordingStateSubscription: EmitterSubscription | null;
+  private _audioSessionEventSubscription: EmitterSubscription | null;
   private _playerSubscription: EmitterSubscription | null;
   private _playerCallback: ((event: PlayBackType) => void) | null;
 
@@ -253,6 +311,37 @@ class AudioRecorderPlayer {
     if (this._recordingStateSubscription) {
       this._recordingStateSubscription.remove();
       this._recordingStateSubscription = null;
+    }
+  };
+
+  /**
+   * Set listener from native module for AVAudioSession-level events that affect
+   * recording reliability but don't change the recording's state machine —
+   * route changes (headphones removed, AirPods disconnect), media services reset
+   * (audio server crash), etc. iOS only; Android currently emits nothing here.
+   */
+  addAudioSessionEventListener = (
+    callback: (event: AudioSessionEventType) => void,
+  ): void => {
+    if (Platform.OS === 'android') {
+      this._audioSessionEventSubscription = DeviceEventEmitter.addListener(
+        'rn-audio-session-event',
+        callback,
+      );
+    } else {
+      const myModuleEvt = new NativeEventEmitter(RNAudioRecorderPlayer);
+
+      this._audioSessionEventSubscription = myModuleEvt.addListener(
+        'rn-audio-session-event',
+        callback,
+      );
+    }
+  };
+
+  removeAudioSessionEventListener = (): void => {
+    if (this._audioSessionEventSubscription) {
+      this._audioSessionEventSubscription.remove();
+      this._audioSessionEventSubscription = null;
     }
   };
 

@@ -51,15 +51,24 @@ enum RecorderError: LocalizedError {
 @objc(RNAudioRecorderPlayer)
 class RNAudioRecorderPlayer: RCTEventEmitter, AVAudioRecorderDelegate {
     // MARK: - Constants
-    
+
     /// Delay before resuming recording after an audio interruption ends.
     /// This workaround is necessary because some SDKs (e.g., Twilio) erroneously call
     /// `setActive(false)` shortly after the interruption ends (~100ms observed in logs).
     /// The delay ensures the audio session is fully stabilized before reactivation.
     private let interruptionRecoveryDelay: TimeInterval = 0.5
-    
+
+    /// How long to wait for capture to actually engage after `record()` is issued
+    /// before treating the start as failed. `AVAudioRecorder.record()` returning `true`
+    /// only means the command was accepted — not that the audio session engaged (it may
+    /// not be ready immediately after an app-update cold launch). The proof that capture
+    /// is live is the recorder's time advancing past zero. See VCS-1961.
+    private let captureEngageTimeout: TimeInterval = 1.0
+    /// Interval between checks while waiting for capture to engage.
+    private let captureEngagePollInterval: TimeInterval = 0.1
+
     // MARK: - Properties
-    
+
     var audioSession: AVAudioSession = .sharedInstance()
     var subscriptionDuration: Double = 0.5
     var audioFileURL: URL?
@@ -441,10 +450,40 @@ class RNAudioRecorderPlayer: RCTEventEmitter, AVAudioRecorderDelegate {
                 guard audioRecorder.record() else { return completion(.failure(.failedToStartRecording)) }
 
                 self.currentAudioRecorder = audioRecorder
-                self.recordingDidStart()
-                self.startRecorderTimer()
-                completion(.success(audioFileURL))
+
+                // `record()` returning true only confirms the command was issued, not that
+                // the audio session actually engaged (it may not be ready right after an
+                // app-update cold launch). Wait until the recorder's time advances before
+                // reporting success, so callers never get a false "started"
+                self.verifyCaptureEngaged(audioRecorder, deadline: CACurrentMediaTime() + self.captureEngageTimeout) { engaged in
+                    guard engaged, self.currentAudioRecorder === audioRecorder else {
+                        audioRecorder.stop()
+                        if self.currentAudioRecorder === audioRecorder {
+                            self.currentAudioRecorder = nil
+                        }
+                        try? self.audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+                        return completion(.failure(.failedToStartRecording))
+                    }
+                    self.recordingDidStart()
+                    self.startRecorderTimer()
+                    completion(.success(audioFileURL))
+                }
             }
+        }
+    }
+
+    /// Polls until capture is confirmed live (the recorder is recording and its time
+    /// has advanced past zero) or the deadline passes. Calls `completion(true)` once
+    /// capture engages, or `completion(false)` if it never does within the window.
+    private func verifyCaptureEngaged(_ recorder: AVAudioRecorder, deadline: CFTimeInterval, completion: @escaping (Bool) -> Void) {
+        if recorder.isRecording && recorder.currentTime > 0 {
+            return completion(true)
+        }
+        guard CACurrentMediaTime() < deadline else {
+            return completion(false)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + captureEngagePollInterval) {
+            self.verifyCaptureEngaged(recorder, deadline: deadline, completion: completion)
         }
     }
 
